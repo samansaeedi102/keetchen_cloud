@@ -1,0 +1,9 @@
+{
+  "projects": {
+    "default": "keetchen",
+    "staging": "keetchen-staging",
+    "production": "keetchen-c8e65"
+  },
+  "targets": {},
+  "etags": {}
+}
