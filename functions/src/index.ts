@@ -1181,12 +1181,12 @@ export const sendChatPushNotification = functions.https.onCall(
 );
 
 // Update order statistics when an order status changes
+// Cloud Function: updateOrderStatistics
 export const updateOrderStatistics = functions.firestore
   .document("orders/{orderId}")
   .onWrite(async (change, context) => {
     console.log("Order statistics update triggered!");
 
-    const orderId = context.params.orderId;
     const beforeData = change.before.exists ? change.before.data() : null;
     const afterData = change.after.exists ? change.after.data() : null;
 
@@ -1198,16 +1198,8 @@ export const updateOrderStatistics = functions.firestore
       return null;
     }
 
-    console.log(
-      `Order ${orderId} status changed from ${beforeStatus} to ${afterStatus}`
-    );
-
-    if (!afterData) {
-      console.log("Order was deleted, skipping statistics update");
-      return null;
-    }
-
-    const vendorId = afterData.vendorId;
+    // Use vendorId from afterData if exists, else from beforeData (for deletions)
+    const vendorId = afterData ? afterData.vendorId : beforeData?.vendorId;
     if (!vendorId) {
       console.log("No vendor ID found for order");
       return null;
@@ -1226,50 +1218,63 @@ export const updateOrderStatistics = functions.firestore
       // Initialize statistics if they don't exist
       const stats = vendorData.orderStatistics || {
         totalOrders: 0,
-        completedOrders: 0, // ✅ This should track "delivered" orders
+        completedOrders: 0,
         pendingOrders: 0,
         rejectedOrders: 0,
       };
 
-      // ✅ FIX: Handle "delivered" status as completed orders
+      // Handle order deletion
+      if (!afterData) {
+        if (beforeStatus === "pending") {
+          stats.pendingOrders = Math.max(0, (stats.pendingOrders || 0) - 1);
+        }
+        if (beforeStatus === "delivered") {
+          stats.completedOrders = Math.max(0, (stats.completedOrders || 0) - 1);
+        }
+        if (beforeStatus === "rejected") {
+          stats.rejectedOrders = Math.max(0, (stats.rejectedOrders || 0) - 1);
+        }
+        stats.totalOrders = Math.max(0, (stats.totalOrders || 0) - 1);
+
+        await vendorRef.update({
+          orderStatistics: stats,
+          lastOrderUpdate: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        return null;
+      }
+
+      // Status transitions
       if (afterStatus === "delivered" && beforeStatus !== "delivered") {
         stats.completedOrders = (stats.completedOrders || 0) + 1;
       }
-
       if (afterStatus === "rejected" && beforeStatus !== "rejected") {
         stats.rejectedOrders = (stats.rejectedOrders || 0) + 1;
       }
-
-      if (afterStatus === "pending" && beforeStatus !== "pending") {
+      // Only increment pendingOrders on status change to "pending" if not a new order
+      if (
+        beforeStatus !== afterStatus &&
+        afterStatus === "pending" &&
+        beforeData
+      ) {
         stats.pendingOrders = (stats.pendingOrders || 0) + 1;
       }
-
-      // ✅ FIX: Handle "accepted" status (between pending and delivered)
       if (afterStatus === "accepted" && beforeStatus !== "accepted") {
-        // Don't increment any counter for accepted - it's a transitional state
-        console.log(`Order ${orderId} accepted, waiting for delivery`);
+        // Transitional state, do nothing
       }
-
-      // Decrease previous status counts
       if (beforeStatus === "delivered" && afterStatus !== "delivered") {
         stats.completedOrders = Math.max(0, (stats.completedOrders || 0) - 1);
       }
-
       if (beforeStatus === "rejected" && afterStatus !== "rejected") {
         stats.rejectedOrders = Math.max(0, (stats.rejectedOrders || 0) - 1);
       }
-
       if (beforeStatus === "pending" && afterStatus !== "pending") {
         stats.pendingOrders = Math.max(0, (stats.pendingOrders || 0) - 1);
       }
-
-      // If this is a new order (no before data)
       if (!beforeData) {
         stats.totalOrders = (stats.totalOrders || 0) + 1;
         if (afterStatus === "pending") {
           stats.pendingOrders = (stats.pendingOrders || 0) + 1;
         }
-        // ✅ Handle case where new order is created directly as delivered (edge case)
         if (afterStatus === "delivered") {
           stats.completedOrders = (stats.completedOrders || 0) + 1;
         }
@@ -1283,6 +1288,74 @@ export const updateOrderStatistics = functions.firestore
       console.log(`Updated vendor ${vendorId} statistics:`, stats);
     } catch (error) {
       console.error("Error updating order statistics:", error);
+    }
+
+    return null;
+  });
+
+export const notifyVendorsOfUpcomingOrders = functions.pubsub
+  .schedule("every day 07:00") // Run every day at 7 AM UTC
+  .timeZone("UTC")
+  .onRun(async (_context) => {
+    const db = admin.firestore();
+    const now = new Date();
+    now.setHours(0, 0, 0, 0);
+    const twoDaysLater = new Date(now);
+    twoDaysLater.setDate(now.getDate() + 2);
+
+    // Query orders with deliveryDate in [now, twoDaysLater], status pending or accepted
+    const ordersSnap = await db
+      .collection("orders")
+      .where("deliveryDate", ">=", now.toISOString())
+      .where("deliveryDate", "<=", twoDaysLater.toISOString())
+      .where("status", "in", ["pending", "accepted"])
+      .get();
+
+    if (ordersSnap.empty) {
+      console.log("No upcoming orders found.");
+      return null;
+    }
+
+    const notifications: any[] = [];
+
+    for (const doc of ordersSnap.docs) {
+      const order = doc.data();
+      const vendorId = order.vendorId;
+      if (!vendorId) continue;
+
+      // Check if a notification for this order & vendor already exists (avoid duplicates)
+      const existing = await db
+        .collection("notifications")
+        .where("userId", "==", vendorId)
+        .where("type", "==", "upcomingOrder")
+        .where("orderId", "==", doc.id)
+        .get();
+      if (!existing.empty) continue;
+
+      notifications.push({
+        userId: vendorId,
+        type: "upcomingOrder",
+        orderId: doc.id,
+        publicCode: order.publicCode || "",
+        deliveryDate: order.deliveryDate,
+        clientName: order.clientName || "",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        read: false,
+      });
+    }
+
+    // Batch create notifications
+    const batch = db.batch();
+    notifications.forEach((notif) => {
+      const ref = db.collection("notifications").doc();
+      batch.set(ref, notif);
+    });
+    if (notifications.length > 0) {
+      await batch.commit();
+      console.log(
+        `Created ${notifications.length} upcoming order notifications.`
+      );
     }
 
     return null;
