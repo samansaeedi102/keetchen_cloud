@@ -8,7 +8,7 @@ admin.initializeApp({
 });
 
 // List of user UIDs to verify
-const userUids = ["DF4UaOKoCeNTS04AmwiCd7RhJ7l1"];
+const userUids = ["JfzuJrjI88OzMGVMz4RFzFuvC1w2"];
 
 async function verifyUsers() {
   for (const uid of userUids) {
