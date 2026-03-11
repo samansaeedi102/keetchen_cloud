@@ -10914,6 +10914,7 @@ const nodemailer = require('nodemailer');
 
 const GMAIL_EMAIL = defineSecret('GMAIL_EMAIL');
 const GMAIL_PASSWORD = defineSecret('GMAIL_PASSWORD');
+const MAILERSEND_API_KEY = defineSecret('MAILERSEND_API_KEY');
 
 admin.initializeApp();
 
@@ -14579,6 +14580,177 @@ export const releaseExpiredPickupHolds = functions.pubsub
       throw error;
     }
   });
+
+
+// HTTPS endpoint — custom token-based email verification using MailerSend HTTP API
+export const sendVerification = functions
+  .runWith({secrets: [MAILERSEND_API_KEY]})
+  .https.onRequest(async (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') { res.status(204).send(''); return; }
+  if (req.method !== 'POST') { res.status(405).json({error: 'Method Not Allowed'}); return; }
+
+  try {
+    const authHeader = (req.get('Authorization') || '').trim();
+    let idToken: string | undefined;
+    if (authHeader.startsWith('Bearer ')) idToken = authHeader.split(' ')[1];
+    if (!idToken && req.body?.idToken) idToken = req.body.idToken;
+    if (!idToken) { res.status(401).json({error: 'Missing idToken'}); return; }
+
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const uid = decoded.uid;
+    const email = decoded.email || req.body?.email;
+    if (!email) { res.status(400).json({error: 'Missing email address'}); return; }
+
+    // Generate a secure random token — bypasses Firebase Auth action-code rate limits entirely
+    const crypto = require('crypto');
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
+
+    // Store token in Firestore
+    await admin.firestore().collection('emailVerifications').doc(token).set({
+      uid,
+      email,
+      expiresAt,
+      used: false,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    const functionBase = 'https://us-central1-keetchen-c8e65.cloudfunctions.net';
+    const verifyLink = `${functionBase}/verifyEmail?token=${token}`;
+
+    // Use MailerSend HTTP API (works on free plan — no SMTP needed)
+    const https = require('https');
+    const body = JSON.stringify({
+      from: {email: 'noreply@keetchen.app', name: 'Keetchen'},
+      to: [{email}],
+      subject: 'Verify your Keetchen email',
+      html: `
+        <p>Hello,</p>
+        <p>Please verify your Keetchen account by clicking the link below:</p>
+        <p><a href="${verifyLink}">Verify email</a></p>
+        <p>If the link does not work, copy and paste this URL into your browser:</p>
+        <p>${verifyLink}</p>
+        <p>This link expires in 24 hours.</p>
+        <p>Thanks — Keetchen</p>
+      `,
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      const request = https.request(
+        {
+          hostname: 'api.mailersend.com',
+          path: '/v1/email',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${MAILERSEND_API_KEY.value()}`,
+            'Content-Length': Buffer.byteLength(body),
+          },
+        },
+        (response: any) => {
+          let data = '';
+          response.on('data', (chunk: any) => { data += chunk; });
+          response.on('end', () => {
+            if (response.statusCode >= 200 && response.statusCode < 300) {
+              resolve();
+            } else {
+              reject(new Error(`MailerSend API error ${response.statusCode}: ${data}`));
+            }
+          });
+        },
+      );
+      request.on('error', reject);
+      request.write(body);
+      request.end();
+    });
+
+    res.json({success: true});
+    return;
+  } catch (err) {
+    console.error('sendVerification error:', err);
+    res.status(500).json({error: 'Internal server error'});
+    return;
+  }
+});
+
+// HTTPS endpoint — validates the custom token and marks the user's email as verified
+export const verifyEmail = functions.https.onRequest(async (req, res) => {
+  const token = (req.query.token as string || '').trim();
+
+  const page = (title: string, emoji: string, heading: string, body: string, color: string) => `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8"/>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+      <title>${title}</title>
+      <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+               background: #f5f5f5; display: flex; align-items: center;
+               justify-content: center; min-height: 100vh; padding: 20px; }
+        .card { background: white; border-radius: 16px; padding: 40px 32px;
+                max-width: 420px; width: 100%; text-align: center;
+                box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
+        .emoji { font-size: 64px; margin-bottom: 20px; }
+        h1 { color: ${color}; font-size: 24px; margin-bottom: 12px; }
+        p { color: #666; font-size: 16px; line-height: 1.5; }
+        .hint { margin-top: 24px; font-size: 14px; color: #999; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <div class="emoji">${emoji}</div>
+        <h1>${heading}</h1>
+        <p>${body}</p>
+        <p class="hint">You can close this page and return to the Keetchen app.</p>
+      </div>
+    </body>
+    </html>`;
+
+  if (!token) {
+    res.status(400).send(page('Error', '❌', 'Invalid Link', 'This verification link is missing a token.', '#e53935'));
+    return;
+  }
+
+  try {
+    const docRef = admin.firestore().collection('emailVerifications').doc(token);
+    const docSnap = await docRef.get();
+
+    if (!docSnap.exists) {
+      res.status(400).send(page('Error', '❌', 'Invalid Link', 'This verification link is invalid or has already expired.', '#e53935'));
+      return;
+    }
+
+    const data = docSnap.data()!;
+
+    if (data.used) {
+      res.send(page('Already Verified', '✅', 'Already Verified', 'Your email address has already been verified. You\'re all set!', '#43a047'));
+      return;
+    }
+
+    if (Date.now() > data.expiresAt) {
+      res.status(400).send(page('Link Expired', '⏰', 'Link Expired', 'This verification link has expired. Please open the Keetchen app and request a new verification email.', '#fb8c00'));
+      return;
+    }
+
+    // Mark email as verified in Firebase Auth
+    await admin.auth().updateUser(data.uid, {emailVerified: true});
+
+    // Mark token as used
+    await docRef.update({used: true, verifiedAt: admin.firestore.FieldValue.serverTimestamp()});
+
+    res.send(page('Email Verified', '🎉', 'Email Verified!', 'Your Keetchen account has been successfully verified. You can now log in and start using the app.', '#43a047'));
+    return;
+  } catch (err) {
+    console.error('verifyEmail error:', err);
+    res.status(500).send(page('Error', '❌', 'Something went wrong', 'Verification failed. Please try again or contact support.', '#e53935'));
+    return;
+  }
+});
 
 // Release expired booking holds and expire related pending bookings
 export const releaseExpiredBookingHolds = functions.pubsub
