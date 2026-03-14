@@ -11905,3 +11905,155 @@ export const resetPassword = functions.https.onRequest(async (req: any, res: any
     res.status(500).json({error: err?.message || 'Internal error'});
   }
 });
+
+// Email admin when a user report is submitted
+export const notifyAdminOnReport = functions
+  .runWith({secrets: [MAILERSEND_API_KEY]})
+  .firestore.document('reports/{reportId}')
+  .onCreate(async (snap: functions.firestore.DocumentSnapshot, context: functions.EventContext) => {
+    const report = snap.data();
+    const reportId = context.params.reportId;
+    if (!report) return null;
+
+    try {
+      // Fetch reporter and reported user details in parallel
+      const [reporterSnap, reportedSnap] = await Promise.all([
+        admin.firestore().collection('users').doc(report.reporterId).get(),
+        admin.firestore().collection('users').doc(report.reportedUserId).get(),
+      ]);
+
+      const reporterData = reporterSnap.data();
+      const reportedData = reportedSnap.data();
+
+      const reporterName = reporterData
+        ? `${reporterData.name || ''} ${reporterData.lastName || ''}`.trim() ||
+          report.reporterId
+        : report.reporterId;
+      const reportedName = reportedData
+        ? `${reportedData.name || ''} ${reportedData.lastName || ''}`.trim() ||
+          report.reportedUserId
+        : report.reportedUserId;
+
+      const reasonLabel = (report.reason as string)
+        .replace(/_/g, ' ')
+        .replace(/\b\w/g, (c: string) => c.toUpperCase());
+
+      const subject = `🚨 New User Report – ${reasonLabel}`;
+      const html = `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <div style="background: linear-gradient(135deg, #c0392b 0%, #922b21 100%); color: white; padding: 30px; border-radius: 12px 12px 0 0; text-align: center;">
+            <h1 style="margin: 0; font-size: 24px;">🚨 Keetchen Admin Alert</h1>
+            <p style="margin: 10px 0 0 0; font-size: 16px; opacity: 0.9;">A user has been reported</p>
+          </div>
+
+          <div style="background: white; border: 1px solid #e0e0e0; border-top: none; border-radius: 0 0 12px 12px; padding: 30px;">
+            <div style="background-color: #fdf2f2; border: 1px solid #f5c6c6; border-radius: 8px; padding: 25px; margin-bottom: 25px;">
+              <h2 style="color: #c0392b; margin: 0 0 20px 0; font-size: 20px;">📋 Report Details</h2>
+              <table style="width: 100%; border-collapse: collapse;">
+                <tr style="border-bottom: 1px solid #f5c6c6;">
+                  <td style="padding: 8px 0; font-weight: bold; color: #495057; width: 40%;">Report ID:</td>
+                  <td style="padding: 8px 0; color: #212529; font-family: monospace; font-size: 12px;">${reportId}</td>
+                </tr>
+                <tr style="border-bottom: 1px solid #f5c6c6;">
+                  <td style="padding: 8px 0; font-weight: bold; color: #495057;">Reason:</td>
+                  <td style="padding: 8px 0; color: #c0392b; font-weight: bold;">${reasonLabel}</td>
+                </tr>
+                <tr style="border-bottom: 1px solid #f5c6c6;">
+                  <td style="padding: 8px 0; font-weight: bold; color: #495057;">Details:</td>
+                  <td style="padding: 8px 0; color: #212529;">${report.details || '(none provided)'}</td>
+                </tr>
+                <tr style="border-bottom: 1px solid #f5c6c6;">
+                  <td style="padding: 8px 0; font-weight: bold; color: #495057;">Reported at:</td>
+                  <td style="padding: 8px 0; color: #212529;">${new Date().toUTCString()}</td>
+                </tr>
+                ${
+                  report.conversationId
+                    ? `<tr style="border-bottom: 1px solid #f5c6c6;">
+                  <td style="padding: 8px 0; font-weight: bold; color: #495057;">Conversation ID:</td>
+                  <td style="padding: 8px 0; color: #212529; font-family: monospace; font-size: 12px;">${report.conversationId}</td>
+                </tr>`
+                    : ''
+                }
+              </table>
+            </div>
+
+            <table style="width: 100%; border-collapse: separate; border-spacing: 12px; margin-bottom: 25px;">
+              <tr>
+                <td style="background-color: #e8f5e9; border: 1px solid #c8e6c9; border-radius: 8px; padding: 20px; vertical-align: top; width: 50%;">
+                  <h3 style="color: #1b5e20; margin: 0 0 12px 0; font-size: 16px;">👤 Reporter</h3>
+                  <p style="margin: 0 0 6px 0; color: #212529; font-weight: bold;">${reporterName}</p>
+                  <p style="margin: 0 0 6px 0; color: #555; font-size: 13px;">Role: ${report.reporterRole}</p>
+                  <p style="margin: 0; color: #777; font-size: 11px; font-family: monospace;">${report.reporterId}</p>
+                </td>
+                <td style="background-color: #fff3e0; border: 1px solid #ffe0b2; border-radius: 8px; padding: 20px; vertical-align: top; width: 50%;">
+                  <h3 style="color: #bf360c; margin: 0 0 12px 0; font-size: 16px;">⚠️ Reported User</h3>
+                  <p style="margin: 0 0 6px 0; color: #212529; font-weight: bold;">${reportedName}</p>
+                  <p style="margin: 0 0 6px 0; color: #555; font-size: 13px;">Role: ${report.reportedUserRole}</p>
+                  <p style="margin: 0; color: #777; font-size: 11px; font-family: monospace;">${report.reportedUserId}</p>
+                </td>
+              </tr>
+            </table>
+
+            <div style="background-color: #f8f9fa; border-radius: 8px; padding: 20px; text-align: center;">
+              <p style="margin: 0; color: #6c757d; font-size: 14px;">
+                📧 This is an automated notification from Keetchen Admin System
+              </p>
+              <p style="margin: 8px 0 0 0; color: #adb5bd; font-size: 12px;">
+                Status: Pending Review | ${new Date().toUTCString()}
+              </p>
+            </div>
+          </div>
+        </div>
+      `;
+
+      const adminEmail = 'samansaeedi102@gmail.com';
+      const https = require('https');
+      const body = JSON.stringify({
+        from: {email: 'noreply@keetchen.app', name: 'Keetchen'},
+        to: [{email: adminEmail}],
+        subject,
+        html,
+      });
+
+      await new Promise<void>((resolve, reject) => {
+        const request = https.request(
+          {
+            hostname: 'api.mailersend.com',
+            path: '/v1/email',
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${MAILERSEND_API_KEY.value()}`,
+              'Content-Length': Buffer.byteLength(body),
+            },
+          },
+          (response: any) => {
+            let data = '';
+            response.on('data', (chunk: any) => {
+              data += chunk;
+            });
+            response.on('end', () => {
+              if (response.statusCode >= 200 && response.statusCode < 300) {
+                resolve();
+              } else {
+                reject(
+                  new Error(
+                    `MailerSend API error ${response.statusCode}: ${data}`,
+                  ),
+                );
+              }
+            });
+          },
+        );
+        request.on('error', reject);
+        request.write(body);
+        request.end();
+      });
+
+      console.log(`✅ Admin notified of report ${reportId} via email`);
+    } catch (error) {
+      console.error('❌ Failed to send report notification email:', error);
+    }
+
+    return null;
+  });
