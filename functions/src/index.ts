@@ -11507,26 +11507,7 @@ export const releaseExpiredBookingHolds = functions.pubsub
                 cancellationReason: 'booking_hold_expired',
               });
               expiredBookingsCount++;
-
-              // Notify client about expiration
-              if (booking.clientId) {
-                const notifRef = db.collection('notifications').doc();
-                batch.set(notifRef, {
-                  userId: booking.clientId,
-                  type: 'bookingExpired',
-                  bookingId: bookingId,
-                  publicCode: booking.publicCode || '',
-                  clientName:
-                    booking.clientInfo?.name || booking.clientName || '',
-                  expired: true,
-                  expiryReason: 'booking_hold_expired',
-                  expiredAt: admin.firestore.FieldValue.serverTimestamp(),
-                  message: '',
-                  createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                  timestamp: admin.firestore.FieldValue.serverTimestamp(),
-                  read: false,
-                });
-              }
+              // Notification is handled by the notifyClientOnBookingStatusChange Firestore trigger
             }
           }
         } else {
@@ -11546,25 +11527,7 @@ export const releaseExpiredBookingHolds = functions.pubsub
                   cancellationReason: 'booking_hold_expired',
                 });
                 expiredBookingsCount++;
-
-                if (booking.clientId) {
-                  const notifRef = db.collection('notifications').doc();
-                  batch.set(notifRef, {
-                    userId: booking.clientId,
-                    type: 'bookingExpired',
-                    bookingId: bdoc.id,
-                    publicCode: booking.publicCode || '',
-                    clientName:
-                      booking.clientInfo?.name || booking.clientName || '',
-                    expired: true,
-                    expiryReason: 'booking_hold_expired',
-                    expiredAt: admin.firestore.FieldValue.serverTimestamp(),
-                    message: '',
-                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                    timestamp: admin.firestore.FieldValue.serverTimestamp(),
-                    read: false,
-                  });
-                }
+                // Notification is handled by the notifyClientOnBookingStatusChange Firestore trigger
               }
             }
           }
